@@ -1,0 +1,122 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body { margin: 0; padding: 0; font-family: sans-serif; }
+  #wrap { position: relative; display: inline-block; width: 100%; user-select: none; }
+  #img { display: block; width: 100%; height: auto; }
+  #line {
+    position: absolute; top: 0; bottom: 0; width: 0;
+    border-left: 2px solid red; cursor: ew-resize; touch-action: none;
+  }
+  #handle {
+    position: absolute; top: 50%; left: -9px; width: 16px; height: 36px;
+    margin-top: -18px; background: red; border-radius: 4px; opacity: 0.85;
+    cursor: ew-resize;
+  }
+  #readout {
+    position: absolute; top: 6px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.65); color: #fff; font-size: 12px;
+    padding: 2px 8px; border-radius: 10px; pointer-events: none;
+  }
+  .disabled #line, .disabled #handle { cursor: default; }
+</style>
+</head>
+<body>
+  <div id="wrap">
+    <img id="img" />
+    <div id="line"><div id="handle"></div></div>
+    <div id="readout"></div>
+  </div>
+
+<script>
+// ---- Streamlit component protocol (vanilla, no React) -------------------
+function post(msg) {
+  msg.isStreamlitMessage = true;
+  window.parent.postMessage(msg, "*");
+}
+const Streamlit = {
+  ready() { post({ type: "streamlit:componentReady", apiVersion: 1 }); },
+  setHeight(h) { post({ type: "streamlit:setFrameHeight", height: h }); },
+  setValue(v) { post({ type: "streamlit:setComponentValue", value: v, dataType: "json" }); },
+};
+
+const wrap = document.getElementById("wrap");
+const img = document.getElementById("img");
+const line = document.getElementById("line");
+const readout = document.getElementById("readout");
+
+let ratio = 0.5;
+let aspect = 1.0;
+let disabled = false;
+let built = false;
+let dragging = false;
+
+function place() {
+  line.style.left = (ratio * 100) + "%";
+  readout.textContent = "split " + ratio.toFixed(3);
+}
+
+function syncHeight() {
+  // image height (width is the iframe width) + a little breathing room
+  Streamlit.setHeight(Math.round(wrap.clientWidth * aspect) + 4);
+}
+
+function ratioFromEvent(e) {
+  const rect = wrap.getBoundingClientRect();
+  const x = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
+  let r = x / rect.width;
+  return Math.min(0.98, Math.max(0.02, r));
+}
+
+function onDown(e) {
+  if (disabled) return;
+  dragging = true;
+  ratio = ratioFromEvent(e);
+  place();
+  e.preventDefault();
+}
+function onMove(e) {
+  if (!dragging) return;
+  ratio = ratioFromEvent(e);   // line follows cursor live, in-browser
+  place();
+  e.preventDefault();
+}
+function onUp() {
+  if (!dragging) return;
+  dragging = false;
+  Streamlit.setValue(ratio);   // commit final position to Python
+}
+
+wrap.addEventListener("mousedown", onDown);
+window.addEventListener("mousemove", onMove);
+window.addEventListener("mouseup", onUp);
+wrap.addEventListener("touchstart", onDown, { passive: false });
+window.addEventListener("touchmove", onMove, { passive: false });
+window.addEventListener("touchend", onUp);
+
+window.addEventListener("resize", syncHeight);
+img.addEventListener("load", syncHeight);
+
+// ---- receive args from Python ------------------------------------------
+window.addEventListener("message", (e) => {
+  if (!e.data || e.data.type !== "streamlit:render") return;
+  const args = e.data.args || {};
+  aspect = args.aspect || 1.0;
+  disabled = !!args.disabled;
+  wrap.className = disabled ? "disabled" : "";
+
+  if (!built) {
+    ratio = (typeof args.ratio === "number") ? args.ratio : 0.5;
+    img.src = args.image_url;
+    built = true;
+  }
+  place();
+  syncHeight();
+});
+
+Streamlit.ready();
+</script>
+</body>
+</html>

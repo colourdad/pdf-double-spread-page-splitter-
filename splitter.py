@@ -48,32 +48,43 @@ def _column_brightness(page: "fitz.Page", dpi: int = 100) -> np.ndarray:
 
 def detect_split_ratio(
     page: "fitz.Page",
-    search_frac: float = 0.2,
-    dpi: int = 100,
+    search_frac: float = 0.12,
+    dpi: int = 80,
+    smooth: int = 15,
 ) -> float:
     """Auto-detect the gutter split position for a spread page.
 
-    The gutter of a scanned book spread shows up as a vertical band that is
-    either darker (binding shadow) or has the steepest brightness change.
-    We restrict the search to a central band of width ``2 * search_frac`` so
-    that dark content elsewhere on the page does not fool the detector, then
-    pick the column with the strongest horizontal gradient, falling back to
-    the darkest column.
+    On a flat book-spread scan the gutter is the meeting point of the two
+    pages' inner margins, which together form the *brightest* vertical strip
+    near the center of the image. We therefore smooth the per-column
+    brightness profile (to ignore thin features like the binding shadow or a
+    single dark text edge) and pick the brightest column within a narrow
+    central band. Restricting to the center also avoids being fooled by the
+    dark scanner border that often runs down one side of a scan.
+
+    This is intentionally a *starting estimate*: real scans vary enough that
+    the position should be confirmed/adjusted by hand (see the web app's
+    draggable split line).
 
     Args:
         page: A PyMuPDF page.
         search_frac: Half-width of the central search band, as a fraction of
-            page width. 0.2 searches the middle 40% of the page.
-        dpi: Render resolution for the analysis. Higher is more precise but
-            slower; 100 is plenty for locating a gutter.
+            page width. 0.12 searches the middle 24% of the page.
+        dpi: Render resolution for the analysis. 80 is ample for a gutter.
+        smooth: Width (in pixels) of the moving-average applied to the column
+            profile before picking the peak. Larger ignores finer detail.
 
     Returns:
         Split position as a fraction of page width in (0, 1).
     """
-    col = _column_brightness(page, dpi=dpi)
+    col = _column_brightness(page, dpi=dpi).astype(float)
     width = col.shape[0]
-    if width < 4:
+    if width < 8:
         return 0.5
+
+    if smooth > 1:
+        k = min(int(smooth), width)
+        col = np.convolve(col, np.ones(k) / k, mode="same")
 
     center = width // 2
     half = max(1, int(search_frac * width))
@@ -82,18 +93,7 @@ def detect_split_ratio(
     if hi <= lo:
         return 0.5
 
-    # Strongest horizontal gradient within the central band. A gutter is an
-    # edge, so |d(brightness)/dx| spikes there.
-    gradient = np.abs(np.diff(col))
-    band_grad = gradient[lo:hi]
-    band_bright = col[lo:hi]
-
-    # Combine: prefer a strong edge that is also relatively dark.
-    grad_score = band_grad / (band_grad.max() + 1e-6)
-    dark_score = 1.0 - (band_bright / 255.0)
-    score = grad_score + dark_score
-    idx = lo + int(np.argmax(score))
-
+    idx = lo + int(np.argmax(col[lo:hi]))
     return float(idx) / float(width)
 
 

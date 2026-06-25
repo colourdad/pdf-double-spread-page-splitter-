@@ -1,8 +1,9 @@
 """Streamlit web app for splitting double-spread book-scan PDFs.
 
-Upload a PDF, preview each spread with the auto-detected split line drawn in
-red, fine-tune any page with a slider (or mark it "don't split" for covers),
-then download the resulting single-page PDF.
+Upload a PDF, then for each spread drag the red split line to the gutter
+(it follows your cursor live and the auto-detected position is the starting
+point). Mark covers / single pages as "don't split". When happy, build and
+download the resulting single-page PDF.
 
 Run with:
     streamlit run app.py
@@ -10,61 +11,47 @@ Run with:
 
 from __future__ import annotations
 
-import io
+import base64
 
 import fitz  # PyMuPDF
 import streamlit as st
-from PIL import Image, ImageDraw
 
 import splitter
+from gutter_picker import gutter_picker
 
-PREVIEW_DPI = 90
+PREVIEW_DPI = 110
 
 
 st.set_page_config(page_title="PDF Spread Splitter", layout="wide")
 st.title("📖 PDF Double-Spread Page Splitter")
 st.caption(
-    "Split scanned book spreads into individual pages. "
-    "The gutter is auto-detected; adjust any page below."
+    "Drag the red line to the gutter on each spread, then build the split PDF."
 )
 
 
 @st.cache_data(show_spinner=False)
-def _render_preview(pdf_bytes: bytes, pno: int, dpi: int = PREVIEW_DPI) -> Image.Image:
-    """Render a single page of the uploaded PDF to a PIL image."""
+def _preview(pdf_bytes: bytes, pno: int, dpi: int = PREVIEW_DPI):
+    """Render page ``pno`` to (data-url, aspect = height/width)."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         pix = doc[pno].get_pixmap(dpi=dpi)
-        return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        url = "data:image/png;base64," + base64.b64encode(pix.tobytes("png")).decode()
+        return url, (pix.height / pix.width if pix.width else 1.0)
     finally:
         doc.close()
 
 
-@st.cache_data(show_spinner="Detecting gutters…")
-def _auto_ratios(pdf_bytes: bytes, search_frac: float) -> list[float]:
-    """Auto-detect a split ratio for every page of the uploaded PDF."""
+@st.cache_data(show_spinner=False)
+def _seed(pdf_bytes: bytes, pno: int) -> float:
+    """Auto-detected starting split ratio for one page."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
-        return [
-            splitter.detect_split_ratio(doc[p], search_frac=search_frac)
-            for p in range(doc.page_count)
-        ]
+        return splitter.detect_split_ratio(doc[pno])
     finally:
         doc.close()
-
-
-def _draw_split_line(img: Image.Image, ratio: float) -> Image.Image:
-    """Return a copy of ``img`` with a red vertical split line at ``ratio``."""
-    out = img.copy()
-    draw = ImageDraw.Draw(out)
-    x = int(ratio * out.width)
-    line_w = max(2, out.width // 300)
-    draw.line([(x, 0), (x, out.height)], fill=(255, 0, 0), width=line_w)
-    return out
 
 
 uploaded = st.file_uploader("Upload a PDF of double-spread scans", type="pdf")
-
 if uploaded is None:
     st.info("Upload a PDF to get started.")
     st.stop()
@@ -74,62 +61,67 @@ doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 page_count = doc.page_count
 doc.close()
 
+# Per-page state persists as you navigate between spreads.
+state = st.session_state.setdefault("pages", {})  # pno -> {"ratio": float, "split": bool}
+
 with st.sidebar:
-    st.header("Settings")
-    search_frac = st.slider(
-        "Gutter search band (½-width)",
-        min_value=0.05,
-        max_value=0.45,
-        value=0.20,
-        step=0.05,
-        help="How far from the center to look for the gutter.",
+    st.header("Navigate")
+    cur = st.number_input(
+        "Spread (page) to edit",
+        min_value=1,
+        max_value=page_count,
+        value=1,
+        step=1,
+    ) - 1
+    st.write(f"Page **{cur + 1}** of **{page_count}**")
+    st.divider()
+    if st.button("Reset this page to auto"):
+        state.pop(cur, None)
+        st.rerun()
+
+# Initialise this page's state from auto-detection the first time we see it.
+entry = state.setdefault(
+    cur, {"ratio": _seed(pdf_bytes, cur), "split": True}
+)
+
+img_url, aspect = _preview(pdf_bytes, cur)
+
+col_main, col_side = st.columns([4, 1])
+with col_side:
+    st.markdown(f"### Page {cur + 1}")
+    split = st.checkbox("Split this page", value=entry["split"], key=f"split_{cur}")
+    entry["split"] = split
+    st.caption(
+        "Drag the red line (or click) to set the gutter. "
+        "Releasing saves the position."
     )
-    cover_first = st.checkbox(
-        "First page is a cover (don't split)", value=False
+    st.metric("Split position", f"{entry['ratio']:.3f}")
+
+with col_main:
+    new_ratio = gutter_picker(
+        image_url=img_url,
+        ratio=entry["ratio"],
+        aspect=aspect,
+        disabled=not split,
+        key=f"gp_{cur}",
     )
-    st.write(f"**{page_count}** page(s) in upload.")
-
-auto = _auto_ratios(pdf_bytes, search_frac)
-
-# Per-page state lives in session_state so slider tweaks persist across reruns.
-st.subheader("Review & adjust pages")
-overrides: list[splitter.SplitPlan] = []
-
-for pno in range(page_count):
-    img = _render_preview(pdf_bytes, pno)
-    default_split = not (cover_first and pno == 0)
-
-    col_img, col_ctrl = st.columns([3, 1])
-    with col_ctrl:
-        st.markdown(f"**Page {pno + 1}**")
-        split = st.checkbox(
-            "Split this page",
-            value=default_split,
-            key=f"split_{pno}",
-        )
-        ratio = st.slider(
-            "Split position",
-            min_value=0.05,
-            max_value=0.95,
-            value=float(round(auto[pno], 3)),
-            step=0.005,
-            key=f"ratio_{pno}",
-            disabled=not split,
-        )
-    with col_img:
-        st.image(
-            _draw_split_line(img, ratio) if split else img,
-            use_container_width=True,
-        )
-
-    overrides.append(splitter.SplitPlan(split=split, ratio=ratio))
+    if new_ratio is not None:
+        entry["ratio"] = float(new_ratio)
 
 st.divider()
 
-if st.button("✂️ Split and build PDF", type="primary"):
+# ---- Build the full split PDF across all pages --------------------------
+if st.button("✂️ Split and build full PDF", type="primary"):
+    plan = []
+    for pno in range(page_count):
+        e = state.get(pno)
+        if e is None:  # never visited -> use auto-detected seed
+            e = {"ratio": _seed(pdf_bytes, pno), "split": True}
+        plan.append(splitter.SplitPlan(split=e["split"], ratio=e["ratio"]))
+
     src = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
-        out = splitter.split_document(src, overrides)
+        out = splitter.split_document(src, plan)
         try:
             buf = out.tobytes(deflate=True, garbage=3)
             n = out.page_count
@@ -139,10 +131,12 @@ if st.button("✂️ Split and build PDF", type="primary"):
         src.close()
 
     st.success(f"Done — produced {n} pages.")
-    out_name = uploaded.name.rsplit(".", 1)[0] + "_split.pdf"
     st.download_button(
         "⬇️ Download split PDF",
         data=buf,
-        file_name=out_name,
+        file_name=uploaded.name.rsplit(".", 1)[0] + "_split.pdf",
         mime="application/pdf",
+    )
+    st.caption(
+        "Pages you didn't open were split at their auto-detected position."
     )
