@@ -132,10 +132,19 @@ if st.button("✂️ Split and build full PDF", type="primary"):
             )
         )
 
+    bar = st.progress(0.0, text="Starting…")
+
+    def _on_progress(done: int, total: int) -> None:
+        bar.progress(done / total, text=f"Building page {done} of {total}…")
+
     src = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
-        out = splitter.split_document(src, plan, dpi=OUTPUT_DPI)
+        with st.spinner("Rendering and splitting pages…"):
+            out = splitter.split_document(
+                src, plan, dpi=OUTPUT_DPI, progress=_on_progress
+            )
         try:
+            bar.progress(1.0, text="Packaging PDF…")
             buf = out.tobytes(deflate=True, garbage=3)
             n = out.page_count
         finally:
@@ -143,6 +152,7 @@ if st.button("✂️ Split and build full PDF", type="primary"):
     finally:
         src.close()
 
+    bar.empty()
     st.success(f"Done — produced {n} pages.")
     st.download_button(
         "⬇️ Download split PDF",

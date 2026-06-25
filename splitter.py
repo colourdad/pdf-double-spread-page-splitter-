@@ -17,7 +17,7 @@ text are preserved at full quality rather than rasterized.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence
 
 import fitz  # PyMuPDF
 import numpy as np
@@ -229,6 +229,7 @@ def split_document(
     src: "fitz.Document",
     plan: Sequence[SplitPlan],
     dpi: int = 200,
+    progress: Optional[Callable[[int, int], None]] = None,
 ) -> "fitz.Document":
     """Apply ``plan`` to ``src`` and return a new split document.
 
@@ -243,6 +244,8 @@ def split_document(
         src: An open PyMuPDF document.
         plan: One :class:`SplitPlan` per source page.
         dpi: Render resolution for the output pages. Higher = sharper/larger.
+        progress: Optional callback ``progress(done, total)`` invoked after
+            each source page, for driving a progress bar.
 
     Returns:
         A fresh in-memory PyMuPDF document; the caller saves and closes it.
@@ -268,13 +271,15 @@ def split_document(
 
         if not p.split:
             _add_image_page(out, img.crop((cl, ct, cr, cb)), dpi)
-            continue
+        else:
+            split_x = min(max(int(round(p.ratio * w)), cl + 1), cr - 1)
+            left = img.crop((cl, ct, split_x, cb))
+            right = img.crop((split_x, ct, cr, cb))
+            for half in (left, right):
+                _add_image_page(out, half, dpi)
 
-        split_x = min(max(int(round(p.ratio * w)), cl + 1), cr - 1)
-        left = img.crop((cl, ct, split_x, cb))
-        right = img.crop((split_x, ct, cr, cb))
-        for half in (left, right):
-            _add_image_page(out, half, dpi)
+        if progress is not None:
+            progress(pno + 1, len(plan))
 
     return out
 
