@@ -1,0 +1,4 @@
+pymupdf>=1.23
+numpy>=1.24
+Pillow>=10.0
+streamlit>=1.30
