@@ -4,117 +4,137 @@
 <meta charset="utf-8" />
 <style>
   html, body { margin: 0; padding: 0; font-family: sans-serif; }
-  #wrap { position: relative; display: inline-block; width: 100%; user-select: none; }
+  #wrap { position: relative; display: inline-block; width: 100%;
+          user-select: none; touch-action: none; }
   #img { display: block; width: 100%; height: auto; }
-  #line {
-    position: absolute; top: 0; bottom: 0; width: 0;
-    border-left: 2px solid red; cursor: ew-resize; touch-action: none;
-  }
-  #handle {
-    position: absolute; top: 50%; left: -9px; width: 16px; height: 36px;
-    margin-top: -18px; background: red; border-radius: 4px; opacity: 0.85;
-    cursor: ew-resize;
-  }
-  #readout {
-    position: absolute; top: 6px; left: 50%; transform: translateX(-50%);
-    background: rgba(0,0,0,0.65); color: #fff; font-size: 12px;
-    padding: 2px 8px; border-radius: 10px; pointer-events: none;
-  }
-  .disabled #line, .disabled #handle { cursor: default; }
+  /* dim everything outside the crop box */
+  #crop { position: absolute; outline: 2px solid #18b34a;
+          box-shadow: 0 0 0 9999px rgba(0,0,0,0.45); }
+  .edge { position: absolute; background: #18b34a; }
+  .v { width: 4px; margin-left: -2px; top: 0; bottom: 0; cursor: ew-resize; }
+  .h { height: 4px; margin-top: -2px; left: 0; right: 0; cursor: ns-resize; }
+  #split { position: absolute; width: 0; border-left: 2px solid red;
+           margin-left: -1px; cursor: ew-resize; }
+  #readout { position: absolute; top: 6px; left: 50%; transform: translateX(-50%);
+             background: rgba(0,0,0,0.7); color: #fff; font-size: 12px;
+             padding: 2px 8px; border-radius: 10px; pointer-events: none;
+             white-space: nowrap; }
+  .disabled .edge, .disabled #split { cursor: default; }
 </style>
 </head>
 <body>
   <div id="wrap">
     <img id="img" />
-    <div id="line"><div id="handle"></div></div>
+    <div id="crop">
+      <div class="edge v" id="eL"></div>
+      <div class="edge v" id="eR"></div>
+      <div class="edge h" id="eT"></div>
+      <div class="edge h" id="eB"></div>
+    </div>
+    <div id="split"></div>
     <div id="readout"></div>
   </div>
 
 <script>
-// ---- Streamlit component protocol (vanilla, no React) -------------------
-function post(msg) {
-  msg.isStreamlitMessage = true;
-  window.parent.postMessage(msg, "*");
-}
+function post(m){ m.isStreamlitMessage = true; window.parent.postMessage(m, "*"); }
 const Streamlit = {
-  ready() { post({ type: "streamlit:componentReady", apiVersion: 1 }); },
-  setHeight(h) { post({ type: "streamlit:setFrameHeight", height: h }); },
-  setValue(v) { post({ type: "streamlit:setComponentValue", value: v, dataType: "json" }); },
+  ready(){ post({ type:"streamlit:componentReady", apiVersion:1 }); },
+  setHeight(h){ post({ type:"streamlit:setFrameHeight", height:h }); },
+  setValue(v){ post({ type:"streamlit:setComponentValue", value:v, dataType:"json" }); },
 };
 
 const wrap = document.getElementById("wrap");
 const img = document.getElementById("img");
-const line = document.getElementById("line");
+const cropEl = document.getElementById("crop");
+const splitEl = document.getElementById("split");
 const readout = document.getElementById("readout");
 
-let ratio = 0.5;
-let aspect = 1.0;
-let disabled = false;
-let built = false;
-let dragging = false;
+let v = { split:0.5, left:0.0, right:1.0, top:0.0, bottom:1.0 };
+let aspect = 1.0, disabled = false, built = false, active = null;
+const MIN = 0.02;
 
-function place() {
-  line.style.left = (ratio * 100) + "%";
-  readout.textContent = "split " + ratio.toFixed(3);
+function clamp(x){ return Math.min(1, Math.max(0, x)); }
+
+function layout(){
+  const L=v.left, R=v.right, T=v.top, B=v.bottom;
+  cropEl.style.left   = (L*100)+"%";
+  cropEl.style.top    = (T*100)+"%";
+  cropEl.style.width  = ((R-L)*100)+"%";
+  cropEl.style.height = ((B-T)*100)+"%";
+  document.getElementById("eL").style.left = "0";
+  document.getElementById("eR").style.left = "100%";
+  document.getElementById("eT").style.top  = "0";
+  document.getElementById("eB").style.top  = "100%";
+  splitEl.style.left   = (v.split*100)+"%";
+  splitEl.style.top    = (T*100)+"%";
+  splitEl.style.height = ((B-T)*100)+"%";
+  splitEl.style.display = disabled ? "none" : "block";
+  readout.textContent =
+    `split ${v.split.toFixed(3)}  ·  crop L${L.toFixed(2)} R${R.toFixed(2)} T${T.toFixed(2)} B${B.toFixed(2)}`;
 }
 
-function syncHeight() {
-  // image height (width is the iframe width) + a little breathing room
-  Streamlit.setHeight(Math.round(wrap.clientWidth * aspect) + 4);
+function syncHeight(){ Streamlit.setHeight(Math.round(wrap.clientWidth*aspect)+4); }
+
+function pos(e){
+  const r = wrap.getBoundingClientRect();
+  const cx = (e.touches ? e.touches[0].clientX : e.clientX) - r.left;
+  const cy = (e.touches ? e.touches[0].clientY : e.clientY) - r.top;
+  return { x: clamp(cx/r.width), y: clamp(cy/r.height) };
 }
 
-function ratioFromEvent(e) {
-  const rect = wrap.getBoundingClientRect();
-  const x = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
-  let r = x / rect.width;
-  return Math.min(0.98, Math.max(0.02, r));
+// pick the nearest control to the pointer (split + 4 crop edges)
+function pick(p){
+  const cands = [
+    { id:"left",  d: Math.abs(p.x - v.left) },
+    { id:"right", d: Math.abs(p.x - v.right) },
+    { id:"split", d: disabled ? 9 : Math.abs(p.x - v.split) },
+    { id:"top",   d: Math.abs(p.y - v.top) },
+    { id:"bottom",d: Math.abs(p.y - v.bottom) },
+  ];
+  cands.sort((a,b)=>a.d-b.d);
+  return cands[0].id;
 }
 
-function onDown(e) {
-  if (disabled) return;
-  dragging = true;
-  ratio = ratioFromEvent(e);
-  place();
-  e.preventDefault();
+function apply(id, p){
+  if(id==="left")   v.left   = Math.min(p.x, v.right - MIN, v.split - MIN);
+  if(id==="right")  v.right  = Math.max(p.x, v.left + MIN, v.split + MIN);
+  if(id==="split")  v.split  = Math.min(Math.max(p.x, v.left + MIN), v.right - MIN);
+  if(id==="top")    v.top    = Math.min(p.y, v.bottom - MIN);
+  if(id==="bottom") v.bottom = Math.max(p.y, v.top + MIN);
+  v.left=clamp(v.left); v.right=clamp(v.right); v.split=clamp(v.split);
+  v.top=clamp(v.top); v.bottom=clamp(v.bottom);
 }
-function onMove(e) {
-  if (!dragging) return;
-  ratio = ratioFromEvent(e);   // line follows cursor live, in-browser
-  place();
-  e.preventDefault();
-}
-function onUp() {
-  if (!dragging) return;
-  dragging = false;
-  Streamlit.setValue(ratio);   // commit final position to Python
-}
+
+function onDown(e){ active = pick(pos(e)); apply(active, pos(e)); layout(); e.preventDefault(); }
+function onMove(e){ if(!active) return; apply(active, pos(e)); layout(); e.preventDefault(); }
+function onUp(){ if(!active) return; active=null; Streamlit.setValue({...v}); }
 
 wrap.addEventListener("mousedown", onDown);
 window.addEventListener("mousemove", onMove);
 window.addEventListener("mouseup", onUp);
-wrap.addEventListener("touchstart", onDown, { passive: false });
-window.addEventListener("touchmove", onMove, { passive: false });
+wrap.addEventListener("touchstart", onDown, {passive:false});
+window.addEventListener("touchmove", onMove, {passive:false});
 window.addEventListener("touchend", onUp);
-
 window.addEventListener("resize", syncHeight);
 img.addEventListener("load", syncHeight);
 
-// ---- receive args from Python ------------------------------------------
-window.addEventListener("message", (e) => {
-  if (!e.data || e.data.type !== "streamlit:render") return;
-  const args = e.data.args || {};
-  aspect = args.aspect || 1.0;
-  disabled = !!args.disabled;
+window.addEventListener("message", (e)=>{
+  if(!e.data || e.data.type !== "streamlit:render") return;
+  const a = e.data.args || {};
+  aspect = a.aspect || 1.0;
+  disabled = !!a.disabled;
   wrap.className = disabled ? "disabled" : "";
-
-  if (!built) {
-    ratio = (typeof args.ratio === "number") ? args.ratio : 0.5;
-    img.src = args.image_url;
+  if(!built){
+    v = {
+      split: num(a.split, 0.5), left: num(a.left, 0.0), right: num(a.right, 1.0),
+      top: num(a.top, 0.0), bottom: num(a.bottom, 1.0),
+    };
+    img.src = a.image_url;
     built = true;
   }
-  place();
-  syncHeight();
+  layout(); syncHeight();
 });
+function num(x, d){ return (typeof x === "number") ? x : d; }
 
 Streamlit.ready();
 </script>

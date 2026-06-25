@@ -66,10 +66,16 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="1-based page numbers to pass through without splitting.",
     )
     p.add_argument(
-        "--dpi",
+        "--detect-dpi",
         type=int,
-        default=100,
-        help="Render resolution used for auto-detection.",
+        default=80,
+        help="Render resolution used for gutter auto-detection.",
+    )
+    p.add_argument(
+        "--output-dpi",
+        type=int,
+        default=200,
+        help="Render resolution of the output page images.",
     )
     return p.parse_args(argv)
 
@@ -95,7 +101,8 @@ def main(argv=None) -> int:
             fixed_ratio=args.ratio,
             search_frac=args.search_range,
             skip_pages=skip,
-            dpi=args.dpi,
+            detect_dpi=args.detect_dpi,
+            output_dpi=args.output_dpi,
         )
     except FileNotFoundError:
         print(f"error: input not found: {args.input}", file=sys.stderr)

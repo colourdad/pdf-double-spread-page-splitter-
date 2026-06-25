@@ -27,15 +27,26 @@ import numpy as np
 class SplitPlan:
     """How a single source page should be handled.
 
+    All positions are fractions of the *full* rendered page (in its displayed
+    orientation): x-fractions for ``ratio``/``left``/``right`` and y-fractions
+    for ``top``/``bottom``.
+
     Attributes:
         split: When True the page is cut into a left and right page. When
-            False the page is passed through to the output unchanged.
-        ratio: Horizontal split position as a fraction of page width in the
-            range (0, 1). 0.5 is the exact middle. Only used when ``split``.
+            False the (cropped) page is emitted as a single page.
+        ratio: Horizontal split position as a fraction of width in (0, 1).
+        left, right: Crop bounds in x; content outside is dropped (removes the
+            black scanner border / book-block edge on the sides).
+        top, bottom: Crop bounds in y; content outside is dropped (removes the
+            black scanner border at top/bottom).
     """
 
     split: bool = True
     ratio: float = 0.5
+    left: float = 0.0
+    right: float = 1.0
+    top: float = 0.0
+    bottom: float = 1.0
 
 
 def _column_brightness(page: "fitz.Page", dpi: int = 100) -> np.ndarray:
@@ -97,12 +108,67 @@ def detect_split_ratio(
     return float(idx) / float(width)
 
 
+def _lead(profile: np.ndarray, dark: float, bridge: int) -> int:
+    """Pixels of background to trim from the start of a 1-D brightness profile.
+
+    Advances while lines are dark (< ``dark``), tolerating up to ``bridge``
+    bright lines (a thin bright scan-edge artifact) before a sustained bright
+    run — the real page content — stops the trim.
+    """
+    last = -1
+    gap = 0
+    for i, v in enumerate(profile):
+        if v < dark:
+            last = i
+            gap = 0
+        else:
+            gap += 1
+            if gap > bridge:
+                break
+    return last + 1
+
+
+def detect_content_box(
+    page: "fitz.Page",
+    dark: float = 130.0,
+    bridge: int = 4,
+    max_trim: float = 0.18,
+    dpi: int = 80,
+) -> tuple[float, float, float, float]:
+    """Auto-detect a crop box that removes dark scanner borders.
+
+    Scanned spreads often have a black scanner background (and a shadowed
+    book-block edge) along the left and bottom. This trims dark lines inward
+    from each edge, returning ``(left, right, top, bottom)`` as fractions of
+    the page. Trimming on any edge is capped at ``max_trim`` so unusual dark
+    content cannot collapse the box — fine-tune by hand if needed.
+    """
+    pix = page.get_pixmap(colorspace=fitz.csGRAY, dpi=dpi)
+    arr = np.frombuffer(pix.samples, dtype=np.uint8)
+    arr = arr.reshape(pix.height, pix.stride)[:, : pix.width].astype(float)
+    h, w = arr.shape
+    cm = arr.mean(axis=0)
+    rm = arr.mean(axis=1)
+
+    left = _lead(cm, dark, bridge) / w
+    right = 1.0 - _lead(cm[::-1], dark, bridge) / w
+    top = _lead(rm, dark, bridge) / h
+    bottom = 1.0 - _lead(rm[::-1], dark, bridge) / h
+
+    left = min(left, max_trim)
+    right = max(right, 1.0 - max_trim)
+    top = min(top, max_trim)
+    bottom = max(bottom, 1.0 - max_trim)
+    return left, right, top, bottom
+
+
 def build_plan(
     doc: "fitz.Document",
     fixed_ratio: Optional[float] = None,
-    search_frac: float = 0.2,
+    search_frac: float = 0.12,
     skip_pages: Optional[Iterable[int]] = None,
-    dpi: int = 100,
+    auto_crop: bool = True,
+    dpi: int = 80,
 ) -> list[SplitPlan]:
     """Build a per-page :class:`SplitPlan` for the whole document.
 
@@ -112,7 +178,9 @@ def build_plan(
             auto-detection. Useful when the scans are perfectly centered.
         search_frac: Passed through to :func:`detect_split_ratio`.
         skip_pages: Zero-based page indices to pass through without splitting
-            (e.g. covers or single-page inserts).
+            (e.g. covers or single-page inserts). These are still cropped.
+        auto_crop: When True, auto-detect a crop box per page to remove dark
+            scanner borders (see :func:`detect_content_box`).
         dpi: Render resolution for auto-detection.
 
     Returns:
@@ -121,50 +189,92 @@ def build_plan(
     skip = set(skip_pages or ())
     plan: list[SplitPlan] = []
     for pno in range(doc.page_count):
-        if pno in skip:
-            plan.append(SplitPlan(split=False))
-        elif fixed_ratio is not None:
-            plan.append(SplitPlan(split=True, ratio=float(fixed_ratio)))
+        page = doc[pno]
+        if auto_crop:
+            left, right, top, bottom = detect_content_box(page, dpi=dpi)
         else:
-            ratio = detect_split_ratio(doc[pno], search_frac=search_frac, dpi=dpi)
-            plan.append(SplitPlan(split=True, ratio=ratio))
+            left, right, top, bottom = 0.0, 1.0, 0.0, 1.0
+
+        if pno in skip:
+            ratio, split = 0.5, False
+        elif fixed_ratio is not None:
+            ratio, split = float(fixed_ratio), True
+        else:
+            ratio = detect_split_ratio(page, search_frac=search_frac, dpi=dpi)
+            split = True
+
+        plan.append(
+            SplitPlan(
+                split=split, ratio=ratio,
+                left=left, right=right, top=top, bottom=bottom,
+            )
+        )
     return plan
+
+
+def _add_image_page(out: "fitz.Document", img: "Image.Image", dpi: int) -> None:
+    """Append a new page sized to a PIL image (at ``dpi``) and draw it."""
+    import io
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    png = buf.getvalue()
+
+    scale = 72.0 / float(dpi)
+    page = out.new_page(width=img.width * scale, height=img.height * scale)
+    page.insert_image(page.rect, stream=png)
 
 
 def split_document(
     src: "fitz.Document",
     plan: Sequence[SplitPlan],
+    dpi: int = 200,
 ) -> "fitz.Document":
     """Apply ``plan`` to ``src`` and return a new split document.
 
     Each spread page becomes two output pages (left then right). Pages whose
-    plan has ``split=False`` are copied through unchanged. The returned
-    document is a fresh in-memory PyMuPDF document; the caller is responsible
-    for saving and closing it.
+    plan has ``split=False`` are copied through unchanged. Pages are rendered
+    in their *displayed* orientation (page rotation is respected) and split
+    along the vertical line, so the output always matches what you see in the
+    preview — regardless of any ``/Rotate`` on the source page. Output pages
+    are images, which is appropriate for scanned material.
+
+    Args:
+        src: An open PyMuPDF document.
+        plan: One :class:`SplitPlan` per source page.
+        dpi: Render resolution for the output pages. Higher = sharper/larger.
+
+    Returns:
+        A fresh in-memory PyMuPDF document; the caller saves and closes it.
     """
+    from PIL import Image
+
     if len(plan) != src.page_count:
         raise ValueError(
             f"plan has {len(plan)} entries but document has {src.page_count} pages"
         )
 
     out = fitz.open()
-    for pno, page_plan in enumerate(plan):
-        page = src[pno]
-        rect = page.rect
+    for pno, p in enumerate(plan):
+        pix = src[pno].get_pixmap(dpi=dpi)  # respects page rotation
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        w, h = img.width, img.height
 
-        if not page_plan.split:
-            new = out.new_page(width=rect.width, height=rect.height)
-            new.show_pdf_page(new.rect, src, pno)
+        # Crop box (pixels), clamped and ordered.
+        cl = min(max(int(round(p.left * w)), 0), w - 1)
+        cr = min(max(int(round(p.right * w)), cl + 1), w)
+        ct = min(max(int(round(p.top * h)), 0), h - 1)
+        cb = min(max(int(round(p.bottom * h)), ct + 1), h)
+
+        if not p.split:
+            _add_image_page(out, img.crop((cl, ct, cr, cb)), dpi)
             continue
 
-        ratio = min(max(page_plan.ratio, 0.01), 0.99)
-        split_x = rect.x0 + ratio * rect.width
-        left = fitz.Rect(rect.x0, rect.y0, split_x, rect.y1)
-        right = fitz.Rect(split_x, rect.y0, rect.x1, rect.y1)
-
-        for clip in (left, right):
-            new = out.new_page(width=clip.width, height=clip.height)
-            new.show_pdf_page(new.rect, src, pno, clip=clip)
+        split_x = min(max(int(round(p.ratio * w)), cl + 1), cr - 1)
+        left = img.crop((cl, ct, split_x, cb))
+        right = img.crop((split_x, ct, cr, cb))
+        for half in (left, right):
+            _add_image_page(out, half, dpi)
 
     return out
 
@@ -173,11 +283,16 @@ def split_pdf_file(
     input_path: str,
     output_path: str,
     fixed_ratio: Optional[float] = None,
-    search_frac: float = 0.2,
+    search_frac: float = 0.12,
     skip_pages: Optional[Iterable[int]] = None,
-    dpi: int = 100,
+    detect_dpi: int = 80,
+    output_dpi: int = 200,
 ) -> int:
     """Convenience wrapper: open, plan, split and save in one call.
+
+    Args:
+        detect_dpi: Resolution used for gutter auto-detection (fast, low).
+        output_dpi: Resolution of the rendered output pages (quality).
 
     Returns the number of pages written to ``output_path``.
     """
@@ -188,9 +303,9 @@ def split_pdf_file(
             fixed_ratio=fixed_ratio,
             search_frac=search_frac,
             skip_pages=skip_pages,
-            dpi=dpi,
+            dpi=detect_dpi,
         )
-        out = split_document(src, plan)
+        out = split_document(src, plan, dpi=output_dpi)
         try:
             out.save(output_path, deflate=True, garbage=3)
             return out.page_count
